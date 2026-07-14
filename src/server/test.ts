@@ -1,179 +1,389 @@
-// ─────────────────────────────────────────────────────────────────
-// @paperclipai/adapter-openrouter — Server Test (Environment Check)
-// Matches real Paperclip AdapterEnvironmentTestContext / Result
-// ─────────────────────────────────────────────────────────────────
-
 import type {
+  AdapterEnvironmentCheck,
   AdapterEnvironmentTestContext,
   AdapterEnvironmentTestResult,
-  AdapterEnvironmentCheck,
 } from "@paperclipai/adapter-utils";
 import {
-  OPENROUTER_MODELS_ENDPOINT,
-  type OpenRouterConfig,
-  type OpenRouterModel,
-} from "../index.js";
+  describeAdapterExecutionTarget,
+  readAdapterExecutionTarget,
+  resolveAdapterExecutionTargetTimeoutSec,
+  runAdapterExecutionTargetProcess,
+} from "@paperclipai/adapter-utils/execution-target";
+import {
+  asNumber,
+  asString,
+  ensureAbsoluteDirectory,
+  parseObject,
+} from "@paperclipai/adapter-utils/server-utils";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import {
+  DEFAULT_GROK_COMMAND,
+  DEFAULT_GROK_MODEL,
+  DEFAULT_MAX_TURNS_PER_RUN,
+  models as fallbackModels,
+} from "../shared/constants.js";
+import { parseGrokStreamJson } from "./parse.js";
 
-export async function testEnvironment(
-  ctx: AdapterEnvironmentTestContext
-): Promise<AdapterEnvironmentTestResult> {
-  const checks: AdapterEnvironmentCheck[] = [];
-  const config = ctx.config as unknown as OpenRouterConfig;
+const GROK_AUTH_REQUIRED_RE =
+  /(?:not\s+logged\s+in|login\s+required|run\s+`?grok\s+login`?|authentication\s+required|unauthorized|invalid\s+credentials)/i;
 
-  // ── 1. Check API key ──────────────────────────────────────────
-  const apiKey =
-    config.apiKey ||
-    process.env.OPENROUTER_API_KEY;
+export function parseGrokModelsOutput(stdout: string): {
+  authenticated: boolean;
+  defaultModel: string | null;
+  models: string[];
+} {
+  const trimmedLines = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const models: string[] = [];
+  let defaultModel: string | null = null;
+  let authenticated = false;
+  let inModelsBlock = false;
 
-  if (!apiKey) {
-    checks.push({
-      code: "openrouter_api_key_missing",
-      level: "error",
-      message: "No OpenRouter API key found",
-      detail: "Set adapterConfig.apiKey or OPENROUTER_API_KEY environment variable.",
-      hint: "Get a key at https://openrouter.ai/keys",
-    });
-    return {
-      adapterType: "openrouter",
-      status: "fail",
-      checks,
-      testedAt: new Date().toISOString(),
-    };
+  for (const line of trimmedLines) {
+    if (/logged in/i.test(line)) authenticated = true;
+    const defaultMatch = /^Default model:\s*(.+)$/i.exec(line);
+    if (defaultMatch?.[1]) {
+      defaultModel = defaultMatch[1].trim();
+      continue;
+    }
+    if (/^Available models:/i.test(line)) {
+      inModelsBlock = true;
+      continue;
+    }
+    if (!inModelsBlock) continue;
+    const bulletMatch = /^[*-]\s*(.+?)(?:\s+\(default\))?$/i.exec(line);
+    if (bulletMatch?.[1]) {
+      models.push(bulletMatch[1].trim());
+      continue;
+    }
+    if (line.length > 0) {
+      models.push(line.replace(/\s+\(default\)$/i, "").trim());
+    }
   }
 
-  if (!apiKey.startsWith("sk-or-")) {
-    checks.push({
-      code: "openrouter_api_key_format",
-      level: "warn",
-      message: "API key does not start with \"sk-or-\"",
-      hint: "Ensure this is a valid OpenRouter key.",
-    });
+  return {
+    authenticated,
+    defaultModel,
+    models: Array.from(new Set(models.filter(Boolean))),
+  };
+}
+
+async function discoverGrokModels(
+  command = DEFAULT_GROK_COMMAND,
+  ctx?: AdapterEnvironmentTestContext,
+): Promise<{ id: string; label: string }[]> {
+  const target = ctx
+    ? readAdapterExecutionTarget({ executionTarget: ctx.executionTarget ?? null })
+    : null;
+  const cwd = asString(ctx?.config.cwd, process.cwd());
+  const config = parseObject(ctx?.config);
+  const envConfig = parseObject(config.env);
+  const env: Record<string, string> = { GROK_DISABLE_AUTOUPDATER: "1" };
+  for (const [key, value] of Object.entries(envConfig)) {
+    if (typeof value === "string") env[key] = value;
   }
+  const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(target, asNumber(config.timeoutSec, 0));
 
-  checks.push({
-    code: "openrouter_api_key_found",
-    level: "info",
-    message: `API key found: ${apiKey.slice(0, 12)}...${apiKey.slice(-4)}`,
-  });
-
-  // ── 2. Test API connectivity & fetch models ───────────────────
   try {
-    const res = await fetch(OPENROUTER_MODELS_ENDPOINT, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-      signal: AbortSignal.timeout(15000),
-    });
-
-    if (!res.ok) {
-      const errText = await res.text();
-      checks.push({
-        code: "openrouter_api_error",
-        level: "error",
-        message: `OpenRouter API returned ${res.status}`,
-        detail: errText.slice(0, 200),
-      });
-      return {
-        adapterType: "openrouter",
-        status: "fail",
-        checks,
-        testedAt: new Date().toISOString(),
-      };
-    }
-
-    const data = (await res.json()) as { data: OpenRouterModel[] };
-    const allModels = data.data || [];
-
-    const freeModels = allModels.filter(
-      (m) =>
-        m.id.endsWith(":free") ||
-        (m.pricing?.prompt === "0" && m.pricing?.completion === "0")
+    const proc = await runAdapterExecutionTargetProcess(
+      `grokcli-models-${Date.now()}`,
+      target,
+      command,
+      ["models"],
+      {
+        cwd,
+        env,
+        timeoutSec: Math.max(1, asNumber(config.helloProbeTimeoutSec, 45)),
+        graceSec: 5,
+        onLog: async () => {},
+      },
     );
-
-    checks.push({
-      code: "openrouter_connected",
-      level: "info",
-      message: `Connected — ${allModels.length} models available (${freeModels.length} free)`,
-    });
-
-    // ── 3. Validate selected model ──────────────────────────────
-    const selectedModel = config.model || "openrouter/auto";
-
-    if (selectedModel === "openrouter/auto") {
-      checks.push({
-        code: "openrouter_model_auto",
-        level: "info",
-        message: "Using auto-routing — OpenRouter selects the best model per request",
-      });
-    } else {
-      const model = allModels.find((m) => m.id === selectedModel);
-      if (model) {
-        const promptCost = parseFloat(model.pricing?.prompt || "0") * 1_000_000;
-        const completionCost = parseFloat(model.pricing?.completion || "0") * 1_000_000;
-        checks.push({
-          code: "openrouter_model_found",
-          level: "info",
-          message: `Model "${selectedModel}" — $${promptCost.toFixed(2)}/$${completionCost.toFixed(2)} per 1M tokens, ${model.context_length?.toLocaleString()} ctx`,
-        });
-      } else {
-        checks.push({
-          code: "openrouter_model_not_found",
-          level: "warn",
-          message: `Model "${selectedModel}" not found — may be deprecated or misspelled`,
-        });
-      }
-    }
-
-    const hasErrors = checks.some((c) => c.level === "error");
-    const hasWarnings = checks.some((c) => c.level === "warn");
-
-    return {
-      adapterType: "openrouter",
-      status: hasErrors ? "fail" : hasWarnings ? "warn" : "pass",
-      checks,
-      testedAt: new Date().toISOString(),
-    };
-  } catch (err: any) {
-    checks.push({
-      code: "openrouter_connection_failed",
-      level: "error",
-      message: `Failed to connect to OpenRouter: ${err.message || err}`,
-    });
-    return {
-      adapterType: "openrouter",
-      status: "fail",
-      checks,
-      testedAt: new Date().toISOString(),
-    };
+    if ((proc.exitCode ?? 1) !== 0) return fallbackModels;
+    const parsed = parseGrokModelsOutput(proc.stdout);
+    if (parsed.models.length === 0) return fallbackModels;
+    return parsed.models.map((id) => ({
+      id,
+      label: id === parsed.defaultModel ? `${id} (default)` : id,
+    }));
+  } catch {
+    return fallbackModels;
   }
 }
 
-/**
- * Fetch all models from OpenRouter — used by listModels() for dynamic model picker.
- */
-export async function listOpenRouterModels(): Promise<{ id: string; label: string }[]> {
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) return [];
+function summarizeStatus(checks: AdapterEnvironmentCheck[]): AdapterEnvironmentTestResult["status"] {
+  if (checks.some((check) => check.level === "error")) return "fail";
+  if (checks.some((check) => check.level === "warn")) return "warn";
+  return "pass";
+}
+
+function firstNonEmptyLine(text: string): string {
+  return (
+    text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean) ?? ""
+  );
+}
+
+function summarizeProbeDetail(stdout: string, stderr: string, parsedError: string | null): string | null {
+  const raw = parsedError?.trim() || firstNonEmptyLine(stderr) || firstNonEmptyLine(stdout);
+  if (!raw) return null;
+  const clean = raw.replace(/\s+/g, " ").trim();
+  const max = 240;
+  return clean.length > max ? `${clean.slice(0, max - 3)}...` : clean;
+}
+
+function resolveGrokHome(): string {
+  const fromEnv = process.env.GROK_HOME;
+  if (fromEnv && fromEnv.trim()) return fromEnv.trim();
+  const home = process.env.HOME || process.env.USERPROFILE || os.homedir();
+  return path.join(home, ".grok");
+}
+
+export async function testEnvironment(
+  ctx: AdapterEnvironmentTestContext,
+): Promise<AdapterEnvironmentTestResult> {
+  const checks: AdapterEnvironmentCheck[] = [];
+  const config = parseObject(ctx.config);
+  const command = asString(config.command, DEFAULT_GROK_COMMAND);
+  const target = readAdapterExecutionTarget({ executionTarget: ctx.executionTarget ?? null });
+  const targetIsRemote = target?.kind === "remote";
+  const cwd = asString(config.cwd, process.cwd());
+  const model = asString(config.model, DEFAULT_GROK_MODEL);
+  const targetLabel = targetIsRemote
+    ? (ctx.environmentName ?? describeAdapterExecutionTarget(target))
+    : null;
+  const runId = `grokcli-envtest-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  if (targetLabel) {
+    checks.push({
+      code: "grokcli_environment_target",
+      level: "info",
+      message: `Probing inside environment: ${targetLabel}`,
+    });
+  }
 
   try {
-    const res = await fetch(OPENROUTER_MODELS_ENDPOINT, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-      signal: AbortSignal.timeout(15000),
+    await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
+    checks.push({
+      code: "grokcli_cwd_valid",
+      level: "info",
+      message: `Working directory is valid: ${cwd}`,
     });
-    if (!res.ok) return [];
-
-    const data = (await res.json()) as { data: OpenRouterModel[] };
-    return (data.data || [])
-      .sort((a, b) => {
-        const aFree = a.id.endsWith(":free") || (a.pricing?.prompt === "0" && a.pricing?.completion === "0");
-        const bFree = b.id.endsWith(":free") || (b.pricing?.prompt === "0" && b.pricing?.completion === "0");
-        if (aFree && !bFree) return -1;
-        if (!aFree && bFree) return 1;
-        return (a.name || a.id).localeCompare(b.name || b.id);
-      })
-      .map((m) => ({
-        id: m.id,
-        label: m.name || m.id,
-      }));
-  } catch {
-    return [];
+  } catch (err) {
+    checks.push({
+      code: "grokcli_cwd_invalid",
+      level: "error",
+      message: err instanceof Error ? err.message : "Invalid working directory",
+      detail: cwd,
+    });
   }
+
+  const envConfig = parseObject(config.env);
+  const env: Record<string, string> = { GROK_DISABLE_AUTOUPDATER: "1" };
+  for (const [key, value] of Object.entries(envConfig)) {
+    if (typeof value === "string") env[key] = value;
+  }
+
+  const configApiKey = env.XAI_API_KEY;
+  const hostApiKey = process.env.XAI_API_KEY;
+  const grokHome = resolveGrokHome();
+  const authFile = path.join(grokHome, "auth.json");
+  let hasAuthFile = false;
+  try {
+    await fs.access(authFile);
+    hasAuthFile = true;
+  } catch {
+    hasAuthFile = false;
+  }
+
+  if (configApiKey?.trim() || hostApiKey?.trim()) {
+    checks.push({
+      code: "grokcli_api_key_found",
+      level: "info",
+      message: "XAI_API_KEY is set — grok-cli will use API key authentication",
+    });
+  } else if (hasAuthFile) {
+    checks.push({
+      code: "grokcli_cached_auth_found",
+      level: "info",
+      message: `Cached grok-cli credentials found at ${authFile}`,
+      hint: "Run `grok login` to refresh credentials if runs fail with auth errors",
+    });
+  } else {
+    checks.push({
+      code: "grokcli_auth_missing",
+      level: "warn",
+      message: "No grok-cli authentication found on the Paperclip host",
+      hint: "Set XAI_API_KEY or run `grok login` on the execution host",
+    });
+  }
+
+  const canRunProbe = checks.every((check) => check.code !== "grokcli_cwd_invalid");
+  const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(target, asNumber(config.timeoutSec, 0));
+
+  if (canRunProbe) {
+    const modelsProbe = await runAdapterExecutionTargetProcess(runId, target, command, ["models"], {
+      cwd,
+      env,
+      timeoutSec: Math.max(1, asNumber(config.helloProbeTimeoutSec, 45)),
+      graceSec: 5,
+      onLog: async () => {},
+    });
+    const probeOutput = `${modelsProbe.stdout}\n${modelsProbe.stderr}`;
+    const parsedModels = parseGrokModelsOutput(modelsProbe.stdout);
+    const authRequired = GROK_AUTH_REQUIRED_RE.test(probeOutput);
+
+    if (modelsProbe.timedOut) {
+      checks.push({
+        code: "grokcli_models_probe_timed_out",
+        level: "warn",
+        message: "`grok models` timed out.",
+      });
+    } else if ((modelsProbe.exitCode ?? 1) !== 0) {
+      checks.push({
+        code: authRequired ? "grokcli_auth_required" : "grokcli_models_probe_failed",
+        level: authRequired ? "warn" : "error",
+        message: authRequired ? "Grok CLI is not authenticated." : "`grok models` failed.",
+        detail: summarizeProbeDetail(modelsProbe.stdout, modelsProbe.stderr, null) ?? undefined,
+      });
+    } else {
+      checks.push({
+        code: "grokcli_models_probe_passed",
+        level: "info",
+        message: parsedModels.authenticated
+          ? "Grok CLI authentication is configured."
+          : "`grok models` completed.",
+        detail: parsedModels.defaultModel ? `Default model: ${parsedModels.defaultModel}` : undefined,
+      });
+      if (parsedModels.models.length > 0) {
+        checks.push({
+          code: "grokcli_models_discovered",
+          level: "info",
+          message: `Discovered ${parsedModels.models.length} Grok model(s).`,
+        });
+      }
+      if (model) {
+        checks.push({
+          code: parsedModels.models.includes(model) ? "grokcli_model_configured" : "grokcli_model_not_found",
+          level: parsedModels.models.includes(model) ? "info" : "warn",
+          message: parsedModels.models.includes(model)
+            ? `Configured model: ${model}`
+            : `Configured model "${model}" not found in available models.`,
+        });
+      }
+    }
+  }
+
+  if (canRunProbe) {
+    const probePromptFile = path.join(os.tmpdir(), `grokcli-probe-${Date.now()}.txt`);
+    await fs.writeFile(probePromptFile, "Respond with exactly hello.", "utf8");
+    try {
+      const probeArgs = [
+        "--cwd",
+        cwd,
+        "--prompt-file",
+        probePromptFile,
+        "--output-format",
+        "streaming-json",
+        "--always-approve",
+        "--no-auto-update",
+        "--max-turns",
+        String(DEFAULT_MAX_TURNS_PER_RUN),
+        "--model",
+        model,
+      ];
+      const helloProbe = await runAdapterExecutionTargetProcess(runId, target, command, probeArgs, {
+        cwd,
+        env,
+        timeoutSec: Math.max(1, asNumber(config.helloProbeTimeoutSec, 60)),
+        graceSec: 5,
+        onLog: async () => {},
+      });
+      const parsed = parseGrokStreamJson(helloProbe.stdout);
+      const detail = summarizeProbeDetail(
+        helloProbe.stdout,
+        helloProbe.stderr,
+        parsed.errorMessage,
+      );
+      const authRequired = GROK_AUTH_REQUIRED_RE.test(`${helloProbe.stdout}\n${helloProbe.stderr}`);
+
+      if (helloProbe.timedOut) {
+        checks.push({
+          code: "grokcli_hello_probe_timed_out",
+          level: "warn",
+          message: "Grok hello probe timed out.",
+        });
+      } else if ((helloProbe.exitCode ?? 1) !== 0 || parsed.stopReason === "Cancelled") {
+        checks.push({
+          code: authRequired ? "grokcli_hello_probe_auth_required" : "grokcli_hello_probe_failed",
+          level: authRequired ? "warn" : "error",
+          message: authRequired
+            ? "Grok CLI could not answer the hello probe because authentication is missing."
+            : "Grok hello probe failed.",
+          ...(detail ? { detail } : {}),
+        });
+      } else if (/\bhello\b/i.test(parsed.summary)) {
+        checks.push({
+          code: "grokcli_hello_probe_passed",
+          level: "info",
+          message: "Grok hello probe succeeded.",
+        });
+      } else {
+        checks.push({
+          code: "grokcli_hello_probe_unexpected_output",
+          level: "warn",
+          message: "Grok hello probe succeeded but returned unexpected output.",
+          ...(detail ? { detail } : {}),
+        });
+      }
+    } finally {
+      await fs.rm(probePromptFile, { force: true }).catch(() => undefined);
+    }
+  }
+
+  return {
+    adapterType: "grokcli",
+    status: summarizeStatus(checks),
+    checks,
+    testedAt: new Date().toISOString(),
+  };
+}
+
+export async function listGrokModels(): Promise<{ id: string; label: string }[]> {
+  return discoverGrokModels();
+}
+
+export async function refreshGrokModels(): Promise<{ id: string; label: string }[]> {
+  return discoverGrokModels();
+}
+
+export async function detectModel(): Promise<{
+  model: string;
+  provider: string;
+  source: string;
+  candidates?: string[];
+} | null> {
+  const fromEnv = process.env.GROK_MODEL;
+  if (fromEnv && fromEnv.trim().length > 0) {
+    return { model: fromEnv.trim(), provider: "xai", source: "env:GROK_MODEL" };
+  }
+
+  const discovered = await discoverGrokModels();
+  const defaultEntry =
+    discovered.find((entry) => entry.label.includes("(default)")) ?? discovered[0] ?? null;
+  if (defaultEntry) {
+    return {
+      model: defaultEntry.id,
+      provider: "xai",
+      source: "grok models",
+      candidates: discovered.map((entry) => entry.id),
+    };
+  }
+
+  return { model: DEFAULT_GROK_MODEL, provider: "xai", source: "default" };
 }

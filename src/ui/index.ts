@@ -1,5 +1,7 @@
-// UI-side exports
-export { parseStdout } from "./parse-stdout.js";
-export { buildConfig, configFields } from "./build-config.js";
-export type { OpenRouterFormValues } from "./build-config.js";
-export type { TranscriptEntry } from "./parse-stdout.js";
+export {
+  createGrokStdoutParser,
+  createStdoutParser,
+  parseGrokStdoutLine,
+  parseStdoutLine,
+} from "./parse-stdout.js";
+export { buildGrokCliConfig } from "./build-config.js";

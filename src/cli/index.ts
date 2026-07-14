@@ -1,2 +1,1 @@
-// CLI-side exports
-export { formatEvent, formatRunSummary } from "./format-event.js";
+export { printGrokStreamEvent } from "./format-event.js";

@@ -2,3 +2,33 @@ node_modules/
 dist/
 *.tsbuildinfo
 README.md.bak
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Icon?
+.fseventsd
+.TemporaryItems
+.DocumentRevisions-V100
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.apdisk
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+*~
+.directory
+.Trash-*

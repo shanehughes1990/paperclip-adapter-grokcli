@@ -1,29 +1,59 @@
 {
-  "name": "paperclip-adapter-openrouter-talha",
+  "name": "@paperclipai/adapter-grokcli",
   "version": "1.0.0",
-  "description": "OpenRouter adapter for Paperclip — access 300+ AI models (free & paid) via a single API key",
+  "description": "Grok CLI adapter for Paperclip — run agents via xAI's grok-cli headless mode with full tool access",
   "license": "MIT",
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./server": "./src/server/index.ts",
-    "./ui": "./src/ui/index.ts",
-    "./cli": "./src/cli/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/server/index.d.ts",
+      "import": "./dist/server/index.js"
+    },
+    "./ui": {
+      "types": "./dist/ui/index.d.ts",
+      "import": "./dist/ui/index.js"
+    },
+    "./cli": {
+      "types": "./dist/cli/index.d.ts",
+      "import": "./dist/cli/index.js"
+    },
+    "./ui-parser": "./dist/ui-parser.js"
+  },
+  "paperclip": {
+    "adapterUiParser": "1.0.0"
   },
   "scripts": {
-    "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "build": "tsc && node scripts/build-ui-parser.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "verify:paperclip": "node scripts/verify-paperclip-loop.mjs",
+    "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@paperclipai/adapter-utils": "workspace:*",
-    "@paperclipai/shared": "workspace:*"
+    "@paperclipai/adapter-utils": "2026.626.0"
   },
   "devDependencies": {
     "@types/node": "^25.5.2",
     "picocolors": "^1.1.1",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.8"
   },
   "peerDependencies": {
     "picocolors": "^1.1.1"
-  }
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "files": [
+    "dist",
+    "ui-parser.cjs",
+    "README.md",
+    "LICENSE"
+  ]
 }
